@@ -14,7 +14,7 @@ import json
 # 로깅 설정
 logging.basicConfig(level=logging.INFO)
 
-# --- 0. [신규] 회사 프로필 및 분석 설정 ---
+# --- 0. 회사 프로필 및 분석 설정 ---
 
 # AI가 분석 기준으로 삼을 회사 프로필 정의
 COMPANY_PROFILE = """
@@ -31,7 +31,7 @@ COMPANY_PROFILE = """
 """
 
 # 광범위 탐색용 키워드 (AI 분석 대상 선별용)
-BROAD_KEYWORDS = {"훈련", "체계", "시스템", "모의", "가상", "증강", "시뮬레이터", "시뮬레이션", "과학화", "교육", "연구개발"}
+BROAD_KEYWORDS = {"훈련", "체계", "시스템", "모의", "가상", "증강", "시뮬레이터", "시뮬레이션", "과학화", "교육", "연구개발", "성능개량"}
 
 # --- 1. 키워드 관리 ---
 KEYWORD_FILE = "keywords.txt"
@@ -320,6 +320,7 @@ def search_and_process(fetch_function, params, keywords, search_field, log_list,
 
 # --- 3. 데이터베이스 (수정됨) ---
 
+# [중요] 이 함수가 있어야 합니다.
 def setup_database():
     conn = sqlite3.connect("procurement_data.db")
     cursor = conn.cursor()
@@ -439,7 +440,7 @@ def upsert_order_plan_data(df, log_list):
 
 # --- 4. AI 분석, 리스크 분석 및 보고서 (대폭 수정) ---
 
-# [신규] AI 관련성 점수 계산 함수 (핵심 로직)
+# AI 관련성 점수 계산 함수 (핵심 로직)
 def calculate_ai_relevance(api_key, df, data_type, log_list):
     """Gemini를 사용하여 데이터프레임의 각 항목에 대한 관련성 점수를 계산합니다 (Batch 처리)."""
     if df.empty:
@@ -553,10 +554,14 @@ def calculate_ai_relevance(api_key, df, data_type, log_list):
         logging.exception(e)
         return df
 
-# (이전 버전과 동일 - 생략된 함수들 복원)
+# (이전 버전과 동일)
 def get_gemini_analysis(api_key, df, log_list):
-    # (이전 버전 코드 사용)
     if df.empty: log_list.append("AI가 분석할 데이터가 없습니다."); return None
+    
+    if not api_key:
+        log_list.append("ℹ️ Gemini API 키가 없어 전략 분석을 생략합니다.")
+        return None
+        
     try:
         genai.configure(api_key=api_key); model = genai.GenerativeModel('gemini-1.5-flash')
         log_list.append("Gemini API로 맞춤형 전략 분석 시작...")
@@ -578,8 +583,12 @@ def get_gemini_analysis(api_key, df, log_list):
         return None
 
 def expand_keywords_with_gemini(api_key, df, existing_keywords, log_list):
-    # (이전 버전 코드 사용)
     if df.empty: log_list.append("키워드 확장을 위한 분석 데이터가 없습니다."); return set()
+    
+    if not api_key:
+        log_list.append("ℹ️ Gemini API 키가 없어 키워드 확장을 생략합니다.")
+        return set()
+
     try:
         genai.configure(api_key=api_key); model = genai.GenerativeModel('gemini-1.5-flash')
         log_list.append("Gemini API로 지능형 키워드 확장 시작...")
@@ -869,6 +878,7 @@ def run_analysis(search_keywords: set, client: NaraJangteoApiClient, gemini_key:
     succ_dfs = []
     for code in ['1','2','3','5']:
         params_with_code = {**succ_bid_base_params, 'bsns_div_cd': code}
+        # 낙찰 정보는 상세 키워드에 해당하는 것만 추적 (광범위 키워드는 사용하지 않음)
         df = search_and_process(
             client.get_successful_bid_info, params_with_code, search_keywords, 'bidNtceNm', log,
             log_prefix=f"낙찰정보(코드:{code})"
@@ -884,6 +894,7 @@ def run_analysis(search_keywords: set, client: NaraJangteoApiClient, gemini_key:
     # 5. 계약정보 (상태 업데이트용, 상세 키워드만 사용)
     log.append("\n========== 5. 계약 정보 수집 ==========")
     contract_params = {'start_date': start_date_str, 'end_date': end_date_str}
+    # 계약 정보는 상세 키워드에 해당하는 것만 추적
     all_found_data['contract'] = search_and_process(
         client.get_contract_info, contract_params, search_keywords, 'cntrctNm', log,
         log_prefix=f"계약정보"
@@ -894,7 +905,7 @@ def run_analysis(search_keywords: set, client: NaraJangteoApiClient, gemini_key:
     
     # --- 보고서 생성 및 후처리 ---
     log.append("\n========== 6. 보고서 생성 및 전략 분석 시작 ==========")
-    # [수정] 보고서 생성 시 최소 관련성 점수 전달
+    # 보고서 생성 시 최소 관련성 점수 전달
     report_dfs = create_report_data("procurement_data.db", log, min_relevance_score)
     risk_df, report_data_bytes, gemini_report = pd.DataFrame(), None, None
 
@@ -919,22 +930,21 @@ def run_analysis(search_keywords: set, client: NaraJangteoApiClient, gemini_key:
         except Exception as e:
             log.append(f"⚠️ 엑셀 파일 생성 중 오류 발생: {e}")
 
-    # AI 전략 분석 및 키워드 확장
-    if gemini_key:
-        if report_dfs and "flat" in report_dfs and report_dfs["flat"] is not None:
-             # AI 전략 분석 (보고서 데이터 기준)
-            gemini_report = get_gemini_analysis(gemini_key, report_dfs["flat"], log)
-        
-        # 키워드 확장 (수집된 모든 데이터를 통합하여 수행)
-        if auto_expand_keywords:
-            combined_df_list = [df for df in all_found_data.values() if df is not None and not df.empty]
-            if combined_df_list:
-                combined_df = pd.concat(combined_df_list, ignore_index=True)
-                new_keywords = expand_keywords_with_gemini(gemini_key, combined_df, search_keywords, log)
-                if new_keywords:
-                    updated_keywords = search_keywords.union(new_keywords)
-                    save_keywords(updated_keywords)
-                    log.append("🎉 키워드 파일이 새롭게 확장되었습니다!")
+    # AI 전략 분석 및 키워드 확장 (API 키 유무 확인은 각 함수 내부에서 처리)
+    if report_dfs and "flat" in report_dfs and report_dfs["flat"] is not None:
+            # AI 전략 분석 (보고서 데이터 기준)
+        gemini_report = get_gemini_analysis(gemini_key, report_dfs["flat"], log)
+    
+    # 키워드 확장 (수집된 모든 데이터를 통합하여 수행)
+    if auto_expand_keywords:
+        combined_df_list = [df for df in all_found_data.values() if df is not None and not df.empty]
+        if combined_df_list:
+            combined_df = pd.concat(combined_df_list, ignore_index=True)
+            new_keywords = expand_keywords_with_gemini(gemini_key, combined_df, search_keywords, log)
+            if new_keywords:
+                updated_keywords = search_keywords.union(new_keywords)
+                save_keywords(updated_keywords)
+                log.append("🎉 키워드 파일이 새롭게 확장되었습니다!")
 
     
     # 최종 결과 반환
