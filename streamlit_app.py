@@ -2,6 +2,8 @@ import streamlit as st
 import analyzer
 import pandas as pd
 from datetime import datetime, timedelta
+import sys
+import importlib
 
 # --- Streamlit 페이지 기본 설정 ---
 st.set_page_config(
@@ -13,7 +15,7 @@ st.set_page_config(
 # --- 세션 상태 초기화 ---
 if 'results' not in st.session_state:
     st.session_state.results = None
-# [신규] AI 점수 임계값 세션 상태 초기화 (기본값 60점)
+# AI 점수 임계값 세션 상태 초기화 (기본값 60점)
 if 'min_score_threshold' not in st.session_state:
     st.session_state.min_score_threshold = 60
 
@@ -24,11 +26,27 @@ st.markdown("---")
 
 # --- 사이드바 UI ---
 with st.sidebar:
+    
+    # [신규] 진단 정보 표시 (오류 해결용)
+    st.header("🔍 진단 정보")
+    # analyzer 모듈에 setup_database 함수가 있는지 확인
+    if hasattr(analyzer, 'setup_database'):
+        st.success("✅ analyzer.py 로드 정상 (setup_database 확인됨)")
+    else:
+        st.error("❌ analyzer.py 로드 비정상 (setup_database 없음). 코드를 확인하고 앱을 재시작/재배포하세요.")
+        # 모듈 강제 리로드 시도 (개발 환경용)
+        if st.button("모듈 다시 로드 시도 (개발용)"):
+            if 'analyzer' in sys.modules:
+                importlib.reload(analyzer)
+            st.rerun()
+
+    st.markdown("---")
+
     st.header("🛠️ 설정 및 관리")
     service_key = st.text_input("공공데이터 서비스 키", type="password", placeholder="공공데이터포털 키를 입력하세요")
     gemini_key = st.text_input("Gemini API 키", type="password", placeholder="Google AI Studio 키를 입력하세요 (AI 분석용)")
     
-    # [신규] AI 관련성 점수 임계값 설정 슬라이더
+    # AI 관련성 점수 임계값 설정 슬라이더
     st.markdown("---")
     st.subheader("⚙️ AI 분석 설정")
     min_score = st.slider(
@@ -98,8 +116,9 @@ with col_date:
 
 with col_options:
     st.markdown("💡 **분석 옵션**")
-    # [수정] 분석 유형 선택 대신 키워드 확장 옵션 제공 (포커스 키워드 입력란 제거됨)
+    # 분석 유형 선택 대신 키워드 확장 옵션 제공
     auto_expand = st.checkbox("AI 기반 자동 키워드 확장 활성화", value=True)
+    # 오류가 발생했던 라인
     st.caption("활성화 시, AI가 관련성 높다고 판단한 사업에서 새로운 키워드를 추출하여 자동으로 저장합니다.")
     
 
@@ -115,13 +134,15 @@ if st.button("분석 시작", type="primary", use_container_width=True):
 
         try:
             client = analyzer.NaraJangteoApiClient(service_key=service_key)
+            
+            # setup_database 호출
             analyzer.setup_database()
             
             # 상세 키워드 로드
             search_keywords = analyzer.load_keywords(analyzer.INITIAL_KEYWORDS)
             
             with st.spinner(f'[{input_start_date} ~ {input_end_date}] 하이브리드 탐색 및 AI 분석 중... (AI 분석 포함 시 시간이 소요될 수 있습니다)'):
-                # [수정] 분석 함수 호출 시 AI 점수 임계값 전달
+                # 분석 함수 호출 시 AI 점수 임계값 전달
                 st.session_state.results = analyzer.run_analysis(
                     search_keywords, client, gemini_key, 
                     start_date=input_start_date, end_date=input_end_date, 
@@ -130,7 +151,11 @@ if st.button("분석 시작", type="primary", use_container_width=True):
                 )
             
             st.rerun()
-            
+
+        except AttributeError as e:
+             # AttributeError 발생 시 명확한 안내 제공
+             st.error(f"🚨 모듈 로드 오류 발생: {e}")
+             st.error("analyzer.py 파일이 최신 버전인지 확인하고 애플리케이션을 재시작/재배포 해주세요. (사이드바의 진단 정보를 확인하세요)")
         except Exception as e:
             st.error(f"🚨 분석 실행 중 예상치 못한 오류가 발생했습니다: {e}")
             st.exception(e)
