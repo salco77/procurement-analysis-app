@@ -1,7 +1,6 @@
 import os
 import requests
 import pandas as pd
-# [수정] date 타입 힌팅 추가
 from datetime import datetime, timedelta, date
 import urllib.parse
 import time
@@ -38,6 +37,15 @@ def save_keywords(keywords: set):
         logging.error(f"Error saving keywords: {e}")
 
 # --- 2. 유틸리티 및 API 클라이언트 ---
+
+# 헬퍼 함수: 안전한 정수 변환 (Robustness 향상)
+def safe_int(value):
+    try:
+        # 빈 문자열 처리 추가
+        return int(float(value)) if value is not None and str(value).strip() != "" else None
+    except (ValueError, TypeError):
+        return None
+
 def save_integrated_excel(data_frames: dict) -> bytes:
     """여러 데이터프레임을 통합 엑셀로 저장합니다. MultiIndex 및 발주계획 스타일링 지원."""
     output = io.BytesIO()
@@ -162,7 +170,7 @@ class NaraJangteoApiClient:
         return []
 
     # --- 발주계획현황서비스 (OrderPlanSttusService) ---
-    # [수정] years 리스트를 받아서 처리 (year 파라미터명은 유지하되 리스트 처리 로직 추가)
+    # years 리스트를 받아서 처리
     def get_order_plans(self, year, log_list):
         # 단일 연도(str/int) 입력 시 리스트로 변환
         years = [str(year)] if isinstance(year, (str, int)) else [str(y) for y in year]
@@ -225,7 +233,11 @@ def search_and_process(fetch_function, params, keywords, search_field, log_list,
     if log_prefix != "발주계획":
         if not raw_data: 
             # API/네트워크 오류(⚠️)가 발생하지 않았을 경우에만 "데이터 없음" 로그 기록
-            is_error = any("⚠️" in log for log in log_list[-2:]) # 최근 2개 로그 확인
+            is_error = False
+            if log_list:
+                 # 최근 로그 확인 (오류 로그는 ⚠️로 시작하도록 통일됨)
+                 is_error = log_list[-1].startswith("⚠️")
+
             if not is_error:
                 log_list.append("조회된 데이터가 없습니다.")
             return pd.DataFrame()
@@ -245,10 +257,84 @@ def search_and_process(fetch_function, params, keywords, search_field, log_list,
     return pd.DataFrame(filtered_data)
 
 # --- 3. 데이터베이스 ---
-# (setup_database, upsert_project_data 함수는 이전 답변과 동일하여 생략)
-# 주의: 실제 파일에는 포함되어야 합니다.
 
-# [수정] year 인자 제거, DataFrame의 'plan_year' 컬럼 사용
+# [필수] 오류 해결을 위해 포함된 함수
+def setup_database():
+    conn = sqlite3.connect("procurement_data.db")
+    cursor = conn.cursor()
+    
+    # 기존 projects 테이블 (입찰공고 ~ 계약)
+    cursor.execute("CREATE TABLE IF NOT EXISTS projects (bidNtceNo TEXT PRIMARY KEY, bidNtceNm TEXT, ntcelnsttNm TEXT, presmptPrce INTEGER, bid_status TEXT DEFAULT '공고', bidNtceDate TEXT, sucsfCorpNm TEXT, cntrctAmt INTEGER, cntrctDate TEXT)")
+    
+    # ALTER TABLE로 컬럼 추가 시 이미 존재하는 경우 오류 발생 방지 (Robustness 향상)
+    try:
+        # PRAGMA를 사용하여 현재 스키마 확인
+        existing_columns = [info[1] for info in cursor.execute("PRAGMA table_info(projects)")]
+        if 'prestandard_status' not in existing_columns:
+            cursor.execute("ALTER TABLE projects ADD COLUMN prestandard_status TEXT")
+        if 'prestandard_no' not in existing_columns:
+            cursor.execute("ALTER TABLE projects ADD COLUMN prestandard_no TEXT")
+        if 'prestandard_date' not in existing_columns:
+            cursor.execute("ALTER TABLE projects ADD COLUMN prestandard_date TEXT")
+    except sqlite3.OperationalError as e:
+        logging.warning(f"Error altering projects table: {e}")
+
+
+    # 발주계획 테이블 (order_plans)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS order_plans (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            plan_year TEXT,
+            category TEXT,        -- 카테고리 (물품/용역/공사)
+            dminsttNm TEXT,       -- 수요기관명
+            prdctNm TEXT,         -- 품명 (검색 대상 필드)
+            asignBdgtAmt INTEGER, -- 배정예산액
+            orderInsttNm TEXT,    -- 발주기관명
+            orderPlanPrd TEXT,    -- 발주예정시기
+            cntrctMthdNm TEXT,    -- 계약방법명
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(plan_year, category, dminsttNm, prdctNm, asignBdgtAmt, orderPlanPrd)
+        )
+    """)
+    
+    conn.commit(); conn.close()
+
+# [필수] 오류 해결을 위해 포함된 함수
+def upsert_project_data(df, stage):
+    if df.empty: return
+    conn = sqlite3.connect("procurement_data.db")
+    cursor = conn.cursor()
+    
+    for _, r in df.iterrows():
+        try:
+            if stage == 'bid':
+                # safe_int 헬퍼 함수 사용
+                cursor.execute("""
+                    INSERT OR IGNORE INTO projects 
+                    (bidNtceNo, bidNtceNm, ntcelnsttNm, presmptPrce, bidNtceDate, prestandard_status, prestandard_no, prestandard_date) 
+                    VALUES (?,?,?,?,?,?,?,?)
+                """, (
+                    r.get('bidNtceNo'), r.get('bidNtceNm'), r.get('ntcelnsttNm'), safe_int(r.get('presmptPrce')), r.get('bidNtceDate'),
+                    r.get('prestandard_status'), r.get('prestandard_no'), r.get('prestandard_date')
+                ))
+            elif stage == 'successful_bid':
+                cursor.execute("""
+                    UPDATE projects SET bid_status='낙찰', sucsfCorpNm=? 
+                    WHERE bidNtceNo=? AND (bid_status='공고' OR bid_status IS NULL)
+                """, (r.get('sucsfCorpNm'), r.get('bidNtceNo')))
+            elif stage == 'contract':
+                # 계약 단계에서는 대표업체명(rprsntCorpNm) 사용, safe_int 사용
+                cursor.execute("""
+                    UPDATE projects SET bid_status='계약완료', sucsfCorpNm=?, cntrctAmt=?, cntrctDate=? 
+                    WHERE bidNtceNo=?
+                """, (r.get('rprsntCorpNm'), safe_int(r.get('cntrctAmt')), r.get('cntrctCnclsDate'), r.get('bidNtceNo')))
+        except Exception as e:
+            logging.error(f"Error upserting project data (stage: {stage}): {e} - Data: {r.to_dict()}")
+            continue # 개별 레코드 오류는 건너뛰고 계속 진행
+
+    conn.commit(); conn.close()
+
+# [필수] 오류 해결을 위해 포함된 함수
 def upsert_order_plan_data(df, log_list):
     if df.empty: return
     conn = sqlite3.connect("procurement_data.db")
@@ -257,30 +343,23 @@ def upsert_order_plan_data(df, log_list):
     
     for _, r in df.iterrows():
         try:
-            # 배정예산액(asignBdgtAmt) 정수형 변환 시도
-            try:
-                budget = int(float(r.get('asignBdgtAmt'))) if r.get('asignBdgtAmt') else None
-            except (ValueError, TypeError):
-                budget = None
-
-            # 'plan_year'는 API 호출 시 데이터에 추가됨
+            # 'plan_year'는 API 호출 시 데이터에 추가됨, safe_int 사용
             cursor.execute("""
                 INSERT OR IGNORE INTO order_plans 
                 (plan_year, category, dminsttNm, prdctNm, asignBdgtAmt, orderInsttNm, orderPlanPrd, cntrctMthdNm) 
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                r.get('plan_year'), # API 호출 시 추가된 연도 정보 사용
+                r.get('plan_year'),
                 r.get('category'),
                 r.get('dminsttNm'),
                 r.get('prdctNm'),
-                budget,
+                safe_int(r.get('asignBdgtAmt')),
                 r.get('orderInsttNm'),
                 r.get('orderPlanPrd'),
                 r.get('cntrctMthdNm')
             ))
         except Exception as e:
             log_list.append(f"⚠️ 경고: 발주계획 DB 삽입 중 오류 발생: {e} - 데이터: {r.to_dict()}")
-            # 개별 레코드 오류는 건너뛰고 계속 진행
             continue
             
     conn.commit()
@@ -290,12 +369,216 @@ def upsert_order_plan_data(df, log_list):
 
 
 # --- 4. AI 분석, 리스크 분석 및 보고서 ---
-# (format_price, get_gemini_analysis, expand_keywords_with_gemini, analyze_project_risk, create_report_data 함수는 이전 답변과 동일하여 생략)
-# 주의: 실제 파일에는 포함되어야 합니다.
+
+# 금액 포맷팅 헬퍼 함수
+def format_price(x):
+    if pd.isna(x):
+        return ""
+    try:
+        # 입력값이 문자열일 경우 쉼표 제거 후 변환 시도
+        if isinstance(x, str):
+             x = x.replace(',', '')
+        return f"{int(float(x)):,}"
+    except (ValueError, TypeError):
+        return ""
+
+# [필수] 오류 해결을 위해 포함된 함수
+def get_gemini_analysis(api_key, df, log_list):
+    # AI 분석은 프로젝트 현황(df, flat data)을 기반으로 수행
+    if df.empty: log_list.append("AI가 분석할 데이터가 없습니다."); return None
+    try:
+        genai.configure(api_key=api_key); model = genai.GenerativeModel('gemini-1.5-flash')
+        log_list.append("Gemini API로 맞춤형 전략 분석 시작...")
+        
+        # 프롬프트 전달 전 금액 포맷팅 적용 (AI 가독성 향상)
+        df_for_prompt = df.copy()
+        if 'presmptPrce' in df_for_prompt.columns:
+             df_for_prompt['presmptPrce'] = df_for_prompt['presmptPrce'].apply(format_price)
+        if 'cntrctAmt' in df_for_prompt.columns:
+             df_for_prompt['cntrctAmt'] = df_for_prompt['cntrctAmt'].apply(format_price)
+             
+        data_for_prompt_str = df_for_prompt[[c for c in ['prestandard_status', 'bidNtceNm', 'bid_status', 'ntcelnsttNm', 'presmptPrce', 'sucsfCorpNm', 'cntrctAmt'] if c in df_for_prompt.columns]].head(30).to_string()
+        
+        prompt = f"""당신은 '위치 및 동작 인식 기술'을 기반으로 VR/MR/AR/XR 가상환경과 현실공간을 정밀하게 매칭(공간 정합)하는 기술을 보유한, 군/경 훈련 시뮬레이터 전문 기업의 '신사업 전략팀장'입니다. 아래 제공된 나라장터 조달 데이터를 바탕으로, 우리 회사의 기술적 강점을 극대화하고 새로운 사업 기회를 발굴하기 위한 심층 분석 보고서를 작성해주세요. 결과는 반드시 아래 형식에 맞춰 마크다운으로 작성해주세요.\n\n[분석 데이터]\n{data_for_prompt_str}\n\n---\n## 군·경 훈련 시뮬레이션 사업 기회 분석 보고서\n\n### 1. 총평 및 핵심 동향\n(우리 회사의 XR 및 공간 정합 기술과 관련성이 높은 훈련 시뮬레이션, 가상현실, MRO 사업의 증감 추세나, 주목해야 할 발주 기관(육군, 경찰청 등)의 동향을 분석해주세요.)\n\n### 2. 주요 사업 심층 분석\n(우리 회사 기술과의 연관성이 가장 높거나 사업적 가치가 큰 프로젝트 3~5개를 선정하여 아래 표 형식으로 분석해주세요. '분석 및 제언' 항목에는 **우리 회사의 핵심 기술인 '공간 정합', '위치/동작 인식' 기술을 적용할 수 있는 지점이나, 기존 시스템을 고도화할 수 있는 사업 기회**를 중점적으로 작성해주세요.)\n\n| 사업명 | 발주기관 | 추정가격/계약금액 | 진행 상태 | 분석 및 제언 (자사 기술 연계 방안) |\n|---|---|---|---|---|\n| (사업명) | (기관명) | (금액) | (상태) | (예: 이 사업은 CQB 훈련 시뮬레이터로, **현실 공간과 가상 훈련 시나리오를 정밀하게 매칭하는 우리 기술**이 핵심 경쟁력이 될 수 있음.) |\n\n### 3. 기술 연계 가능 키워드\n(데이터에서 식별된 키워드 중, 우리 회사의 '위치/동작 인식' 및 'XR 가시화' 기술과 직접적으로 연결될 수 있는 핵심 키워드를 5개 이상 선정하여 불렛 포인트로 나열해주세요.)\n\n### 4. 차기 사업 전략 제언\n(위 분석을 종합하여, 우리 회사가 다음 분기에 집중해야 할 사업 영역, 기술 고도화 방향 등에 대한 구체적인 실행 전략을 1~2가지 제언해주세요.)"""
+        response = model.generate_content(prompt); log_list.append("Gemini 맞춤형 전략 분석 완료.")
+        return response.text
+    except Exception as e: 
+        log_list.append(f"⚠️ Gemini API 호출 중 오류 발생: {e}")
+        logging.error(f"Gemini API Error: {e}")
+        return None
+
+# [필수] 오류 해결을 위해 포함된 함수
+def expand_keywords_with_gemini(api_key, df, existing_keywords, log_list):
+    # 키워드 확장은 수집된 모든 데이터(df)를 기반으로 수행
+    if df.empty: log_list.append("키워드 확장을 위한 분석 데이터가 없습니다."); return set()
+    try:
+        genai.configure(api_key=api_key); model = genai.GenerativeModel('gemini-1.5-flash')
+        log_list.append("Gemini API로 지능형 키워드 확장 시작...")
+        # 발주계획(prdctNm) 및 사전규격(prdctClsfcNoNm)도 포함하여 분석 대상 확대
+        project_titles = pd.concat([df[col] for col in ['bidNtceNm', 'cntrctNm', 'prdctClsfcNoNm', 'prdctNm'] if col in df.columns]).dropna().unique()
+        project_titles_str = '\n- '.join(project_titles[:50]) # 프롬프트 길이 고려
+        
+        prompt = f"""당신은 군/경 훈련 시뮬레이터 전문 기업의 조달 정보 분석가입니다. 우리 회사는 '위치/동작 인식', 'XR 공간 정합' 기술을 보유하고 있습니다. 아래는 현재 우리가 사용중인 검색 키워드와, 최근 조달 시스템에서 발견된 사업명/품명 목록입니다. 이 정보를 바탕으로, 우리 회사의 기술과 관련성이 높으면서도 기존 키워드에 없는 **새로운 검색 키워드를 5~10개 추천**해주세요. 결과는 다른 설명 없이, 쉼표(,)로 구분된 키워드 목록으로만 제공해주세요.\n\n[기존 키워드]\n{', '.join(sorted(list(existing_keywords)))}\n\n[최근 발견된 사업명/품명]\n- {project_titles_str}\n\n[추천 키워드]"""
+        response = model.generate_content(prompt)
+        new_keywords = {k.strip() for k in response.text.strip().split(',') if k.strip() and len(k.strip()) > 1}
+        log_list.append(f"Gemini가 추천한 신규 키워드: {new_keywords}")
+        return new_keywords
+    except Exception as e: 
+        log_list.append(f"⚠️ Gemini 키워드 확장 중 오류 발생: {e}")
+        return set()
+
+# [필수] 오류 해결을 위해 포함된 함수
+def analyze_project_risk(df: pd.DataFrame) -> pd.DataFrame:
+    # 리스크 분석은 flat data(금액이 숫자형)를 기반으로 수행
+    ongoing_df = df[df['bid_status'].isin(['공고', '낙찰'])].copy()
+    if ongoing_df.empty: return pd.DataFrame()
+    
+    ongoing_df['score'] = 0
+    ongoing_df['risk_reason'] = ''
+    # 날짜 컬럼을 datetime 객체로 변환
+    ongoing_df['bidNtceDate_dt'] = pd.to_datetime(ongoing_df['bidNtceDate'], errors='coerce')
+    
+    # 분석 시점 기준 시간
+    current_time = datetime.now()
+
+    for index, row in ongoing_df.iterrows():
+        reasons = []
+        score = 0
+        
+        # 리스크 요인 1: 공고 후 30일 경과 (분석 시점 기준)
+        if pd.notna(row['bidNtceDate_dt']) and row['bid_status'] == '공고':
+            days_elapsed = (current_time - row['bidNtceDate_dt']).days
+            if days_elapsed > 30:
+                score += 5
+                reasons.append(f'공고 후 {days_elapsed}일 경과')
+        
+        # 리스크 요인 2: 사전규격 미공개
+        if row.get('prestandard_status') == '해당 없음':
+            score += 3
+            reasons.append('사전규격 미공개')
+        
+        # 리스크 요인 3: 소규모 사업 (5천만원 미만)
+        # flat data이므로 금액은 숫자형임
+        price = row.get('presmptPrce')
+        # 숫자형인지 확인 후 비교
+        if pd.notna(price) and isinstance(price, (int, float)) and 0 < price < 50000000:
+            score += 2
+            reasons.append('소규모 사업 (5천만원 미만)')
+        
+        ongoing_df.loc[index, 'score'] = score
+        ongoing_df.loc[index, 'risk_reason'] = ', '.join(reasons)
+    
+    # 리스크 등급 산정
+    ongoing_df['risk_level'] = ongoing_df['score'].apply(lambda s: '높음' if s >= 7 else ('보통' if s >= 4 else '낮음'))
+    
+    # 보고서용 테이블 생성 및 정렬
+    risk_table = ongoing_df[['bidNtceNm', 'ntcelnsttNm', 'bid_status', 'risk_level', 'risk_reason']]
+    return risk_table.rename(columns={'bidNtceNm':'사업명','ntcelnsttNm':'발주기관','bid_status':'진행 상태','risk_level':'리스크 등급','risk_reason':'주요 리스크'}).sort_values(by='리스크 등급',key=lambda x:x.map({'높음':0,'보통':1,'낮음':2}))
+
+# [필수] 오류 해결을 위해 포함된 함수
+def create_report_data(db_path, keywords, log_list):
+    log_list.append("DB에서 최종 데이터 조회 중...")
+    conn = sqlite3.connect(db_path)
+    report_data = {} # 결과를 담을 딕셔너리
+
+    try:
+        # 1. 프로젝트(입찰공고 이후) 데이터 처리
+        try:
+            # bidNtceDate 기준으로 내림차순 정렬하여 최신순으로 조회
+            all_projects_df = pd.read_sql_query("SELECT * FROM projects ORDER BY bidNtceDate DESC", conn)
+        except pd.errors.DatabaseError as e:
+            log_list.append(f"⚠️ 프로젝트 DB 조회 중 오류: {e}")
+            all_projects_df = pd.DataFrame()
+
+        
+        if not all_projects_df.empty:
+            # 키워드 필터링
+            flat_df = all_projects_df[all_projects_df['bidNtceNm'].str.contains('|'.join(keywords),case=False,na=False)].copy()
+            
+            if not flat_df.empty:
+                # [중요] 분석용 원본 데이터 저장 (금액: 숫자형)
+                report_data["flat"] = flat_df.copy()
+
+                # 보고서용 데이터 포맷팅 시작 (이후 flat_df는 보고서용으로 사용)
+                # 날짜 포맷팅 (YYYY-MM-DD)
+                for col in ['prestandard_date','bidNtceDate','cntrctDate']:
+                    if col in flat_df.columns: 
+                        flat_df[col] = pd.to_datetime(flat_df[col],errors='coerce').dt.strftime('%Y-%m-%d')
+                
+                # 금액 포맷팅 (금액: 문자열)
+                for col in ['presmptPrce','cntrctAmt']:
+                    if col in flat_df.columns: 
+                        flat_df[col] = flat_df[col].apply(format_price)
+
+                # 구조화된 데이터프레임 (MultiIndex) 생성
+                structured_columns = {
+                    ('프로젝트 개요','사업명'):flat_df.get('bidNtceNm'), 
+                    ('프로젝트 개요','발주기관'):flat_df.get('ntcelnsttNm'), 
+                    ('진행 현황','종합 상태'):flat_df.get('bid_status'), 
+                    ('진행 현황','낙찰/계약사'):flat_df.get('sucsfCorpNm'), 
+                    ('사전 규격 정보','공개 상태'):flat_df.get('prestandard_status'), 
+                    ('사전 규격 정보','공개일'):flat_df.get('prestandard_date'), 
+                    ('입찰 공고 정보','공고일'):flat_df.get('bidNtceDate'), 
+                    ('입찰 공고 정보','추정가격'):flat_df.get('presmptPrce'), 
+                    ('계약 체결 정보','계약일'):flat_df.get('cntrctDate'), 
+                    ('계약 체결 정보','계약금액'):flat_df.get('cntrctAmt'), 
+                    ('참조 번호','사전규격번호'):flat_df.get('prestandard_no'), 
+                    ('참조 번호','입찰공고번호'):flat_df.get('bidNtceNo')
+                }
+                report_data["structured"] = pd.DataFrame(structured_columns)
+                log_list.append("프로젝트 현황 보고서 데이터 생성 완료.")
+
+        # 2. 발주계획 데이터 처리
+        try:
+            # created_at 기준으로 내림차순 정렬하여 최신 데이터 조회
+            all_order_plans_df = pd.read_sql_query("SELECT * FROM order_plans ORDER BY created_at DESC", conn)
+        except pd.errors.DatabaseError as e:
+             log_list.append(f"⚠️ 발주계획 DB 조회 중 오류: {e}")
+             all_order_plans_df = pd.DataFrame()
+
+        if not all_order_plans_df.empty:
+             # 키워드 필터링 (품명 기준 - prdctNm)
+            order_plan_df = all_order_plans_df[all_order_plans_df['prdctNm'].str.contains('|'.join(keywords),case=False,na=False)].copy()
+
+            if not order_plan_df.empty:
+                # 중복 제거: (연도, 카테고리, 기관명, 품명) 기준으로 가장 최신 데이터만 남김
+                # 이미 created_at DESC로 정렬되었으므로 keep='first' 사용
+                order_plan_df = order_plan_df.drop_duplicates(subset=['plan_year', 'category', 'dminsttNm', 'prdctNm'], keep='first')
+
+                # 금액 포맷팅 (원본 금액은 유지하고 포맷팅된 컬럼 추가)
+                order_plan_df['asignBdgtAmt_formatted'] = order_plan_df['asignBdgtAmt'].apply(format_price)
+                
+                # 보고서용 컬럼명 변경 및 선택
+                order_plan_report_df = order_plan_df[[
+                    'plan_year', 'category', 'dminsttNm', 'prdctNm', 'asignBdgtAmt_formatted', 'orderPlanPrd', 'cntrctMthdNm'
+                ]].rename(columns={
+                    'plan_year': '년도',
+                    'category': '구분(물품/용역/공사)',
+                    'dminsttNm': '수요기관명',
+                    'prdctNm': '품명 (사업명)',
+                    'asignBdgtAmt_formatted': '배정예산액',
+                    'orderPlanPrd': '발주예정시기',
+                    'cntrctMthdNm': '계약방법'
+                })
+                # 최종 정렬: 예산액 기준 내림차순 (문자열로 포맷팅된 금액을 숫자로 변환하여 정렬)
+                report_data["order_plan"] = order_plan_report_df.sort_values(by='배정예산액', ascending=False, key=lambda x: pd.to_numeric(x.str.replace(',', ''), errors='coerce'))
+                log_list.append("발주계획 현황 보고서 데이터 생성 완료.")
+
+        if not report_data:
+             log_list.append("DB에 키워드에 해당하는 데이터(프로젝트 또는 발주계획)가 없습니다.")
+             return None
+             
+        return report_data
+
+    except Exception as e: 
+        log_list.append(f"⚠️ 보고서 데이터 생성 중 예상치 못한 오류 발생: {e}")
+        logging.exception(e)
+        return None
+    finally: 
+        conn.close()
 
 
-# --- 5. 메인 실행 함수 (전면 수정됨) ---
-# [수정] start_date, end_date를 입력받도록 변경 (Streamlit에서 date 객체로 전달됨)
+# --- 5. 메인 실행 함수 ---
 def run_analysis(search_keywords: set, client: NaraJangteoApiClient, gemini_key: str, start_date: date, end_date: date, auto_expand_keywords: bool = True):
     log = []; all_found_data = {}
     
@@ -328,10 +611,10 @@ def run_analysis(search_keywords: set, client: NaraJangteoApiClient, gemini_key:
 
     # 1. 발주계획 (연간)
     log.append("\n--- 1. 발주계획 정보 조회 시작 ---")
-    # [수정] 시작 연도부터 종료 연도까지 모든 연도 리스트 생성
+    # 시작 연도부터 종료 연도까지 모든 연도 리스트 생성
     target_years = list(range(start_date.year, end_date.year + 1))
     
-    # API 호출 파라미터 (year에 연도 리스트 전달 - Client가 리스트 처리 지원하도록 수정됨)
+    # API 호출 파라미터 (year에 연도 리스트 전달)
     order_plan_params = {'year': target_years}
     
     # 데이터 조회 및 필터링
@@ -341,7 +624,6 @@ def run_analysis(search_keywords: set, client: NaraJangteoApiClient, gemini_key:
     )
     # DB 저장
     if not all_found_data['order_plan'].empty:
-        # 개선된 upsert 함수 호출 (데이터프레임 내 'plan_year' 사용)
         upsert_order_plan_data(all_found_data['order_plan'], log)
 
     # 2. 사전규격 (지정 기간)
@@ -425,7 +707,7 @@ def run_analysis(search_keywords: set, client: NaraJangteoApiClient, gemini_key:
 
     # 데이터가 하나라도 존재하면 엑셀 생성 진행
     if report_dfs:
-        # 리스크 분석
+        # 리스크 분석 (DB에서 가져온 원본 'flat' 데이터 사용 - 숫자형)
         if "flat" in report_dfs and report_dfs["flat"] is not None:
              risk_df = analyze_project_risk(report_dfs["flat"])
 
@@ -448,21 +730,25 @@ def run_analysis(search_keywords: set, client: NaraJangteoApiClient, gemini_key:
             log.append(f"⚠️ 엑셀 파일 생성 중 오류 발생: {e}")
 
     # AI 분석 및 키워드 확장
-    if gemini_key and report_dfs:
-        # AI 전략 분석
-        if "flat" in report_dfs and report_dfs["flat"] is not None:
-            gemini_report = get_gemini_analysis(gemini_key, report_dfs["flat"], log)
-        
-        # 키워드 확장
-        if auto_expand_keywords:
-            combined_df_list = [df for df in all_found_data.values() if df is not None and not df.empty]
-            if combined_df_list:
-                combined_df = pd.concat(combined_df_list, ignore_index=True)
-                new_keywords = expand_keywords_with_gemini(gemini_key, combined_df, search_keywords, log)
-                if new_keywords:
-                    updated_keywords = search_keywords.union(new_keywords)
-                    save_keywords(updated_keywords)
-                    log.append("🎉 키워드 파일이 새롭게 확장되었습니다!")
+    if gemini_key:
+        if report_dfs:
+            # AI 전략 분석 (DB에서 가져온 원본 'flat' 데이터 사용 - 숫자형)
+            if "flat" in report_dfs and report_dfs["flat"] is not None:
+                gemini_report = get_gemini_analysis(gemini_key, report_dfs["flat"], log)
+            
+            # 키워드 확장 (API로 수집된 모든 데이터 통합)
+            if auto_expand_keywords:
+                combined_df_list = [df for df in all_found_data.values() if df is not None and not df.empty]
+                if combined_df_list:
+                    combined_df = pd.concat(combined_df_list, ignore_index=True)
+                    new_keywords = expand_keywords_with_gemini(gemini_key, combined_df, search_keywords, log)
+                    if new_keywords:
+                        updated_keywords = search_keywords.union(new_keywords)
+                        save_keywords(updated_keywords)
+                        log.append("🎉 키워드 파일이 새롭게 확장되었습니다!")
+        else:
+             log.append("ℹ️ 분석할 데이터가 없어 AI 분석 및 키워드 확장을 생략합니다.")
+
     
     # 최종 결과 반환
     return {
@@ -472,15 +758,3 @@ def run_analysis(search_keywords: set, client: NaraJangteoApiClient, gemini_key:
         "report_filename": f"integrated_report_{execution_time.strftime('%Y%m%d_%H%M%S')}.xlsx", 
         "gemini_report": gemini_report
     }
-
-# ====================================================================================
-# 참고: 아래 함수들은 이전 답변의 코드를 그대로 사용합니다. (지면 관계상 생략)
-# 실제 analyzer.py 파일에는 아래 함수들이 모두 포함되어야 합니다.
-# ====================================================================================
-# def setup_database(): ...
-# def upsert_project_data(df, stage): ...
-# def format_price(x): ...
-# def get_gemini_analysis(api_key, df, log_list): ...
-# def expand_keywords_with_gemini(api_key, df, existing_keywords, log_list): ...
-# def analyze_project_risk(df: pd.DataFrame) -> pd.DataFrame: ...
-# def create_report_data(db_path, keywords, log_list): ...
