@@ -4,6 +4,7 @@ import pandas as pd
 from datetime import datetime, timedelta
 import sys
 import importlib
+import io # io 모듈 임포트 추가
 
 # --- Streamlit 페이지 기본 설정 ---
 st.set_page_config(
@@ -11,6 +12,14 @@ st.set_page_config(
     page_icon="🚀",
     layout="wide",
 )
+
+# Streamlit rerun 호환성 처리 함수
+def rerun_app():
+    try:
+         st.rerun()
+    except AttributeError:
+         # 구버전 Streamlit 호환성
+         st.experimental_rerun()
 
 # --- 세션 상태 초기화 ---
 if 'results' not in st.session_state:
@@ -27,16 +36,35 @@ st.markdown("---")
 # --- 사이드바 UI ---
 with st.sidebar:
     
-    # 진단 정보 표시
-    st.header("🔍 진단 정보")
+    # [수정됨] 진단 정보 및 버전 확인 섹션 강화
+    st.header("🔍 진단 정보 및 버전 확인")
     if hasattr(analyzer, 'setup_database'):
         st.success("✅ analyzer.py 로드 정상")
+        
+        # [신규 추가] 네거티브 키워드 개수 표시 (버전 확인용)
+        # 이 기능으로 현재 로드된 analyzer.py가 최신 버전인지 확인합니다.
+        try:
+            neg_keyword_count = len(analyzer.NEGATIVE_KEYWORDS)
+            # 최신 버전 기준(v3)으로 50개 이상이어야 함
+            if neg_keyword_count > 50:
+                st.info(f"💡 로드된 네거티브 키워드: {neg_keyword_count}개 (최신 버전 감지됨)")
+            else:
+                st.error(f"⚠️ 로드된 네거티브 키워드: {neg_keyword_count}개 (구버전 의심). analyzer.py를 최신으로 교체하고 앱을 완전히 재시작(Ctrl+C 후 재실행)하세요.")
+        except Exception as e:
+            st.error(f"❌ 네거티브 키워드 정보 로드 실패: {e}")
+
     else:
         st.error("❌ analyzer.py 로드 비정상. 코드를 확인하고 앱을 재시작/재배포하세요.")
-        if st.button("모듈 다시 로드 시도 (개발용)"):
-            if 'analyzer' in sys.modules:
+
+    # [개선됨] 모듈 강제 다시 로드 버튼
+    if st.button("🔄 모듈 강제 다시 로드 (실패 시 앱 재시작)"):
+        if 'analyzer' in sys.modules:
+            try:
                 importlib.reload(analyzer)
-            st.rerun()
+                st.success("모듈 다시 로드 성공! 페이지를 새로고침합니다.")
+            except Exception as e:
+                st.error(f"모듈 다시 로드 실패: {e}. 앱을 재시작하세요.")
+        rerun_app()
 
     st.markdown("---")
 
@@ -62,23 +90,31 @@ with st.sidebar:
         st.info("상세 키워드에 매칭되는 사업은 관련성 100점으로 처리됩니다. AI는 이 목록을 기반으로 키워드를 자동 확장합니다.")
         try:
             current_keywords = analyzer.load_keywords(analyzer.INITIAL_KEYWORDS)
+            st.markdown(f"**현재 키워드 수: {len(current_keywords)}개**")
+            
+            # 키워드 목록 보기 (UI 개선)
+            if st.checkbox("현재 키워드 목록 보기"):
+                st.text_area("키워드 목록", value="\n".join(sorted(list(current_keywords))), height=150, disabled=True)
+
             keywords_to_remove = st.multiselect("삭제할 키워드:", sorted(list(current_keywords)))
             if st.button("선택한 키워드 삭제"):
                 if keywords_to_remove:
                     updated_keywords = current_keywords - set(keywords_to_remove)
                     analyzer.save_keywords(updated_keywords)
                     st.success("키워드가 삭제되었습니다.")
-                    st.rerun()
+                    rerun_app()
                 else:
                     st.warning("삭제할 키워드를 선택해주세요.")
-            new_keywords_str = st.text_area("추가할 키워드 (쉼표로 구분):")
+            
+            # 텍스트 입력 방식으로 변경 (text_area -> text_input)
+            new_keywords_str = st.text_input("추가할 키워드 (쉼표로 구분):")
             if st.button("키워드 추가"):
                 if new_keywords_str:
                     new_keywords = {k.strip() for k in new_keywords_str.split(',') if k.strip()}
                     updated_keywords = current_keywords.union(new_keywords)
                     analyzer.save_keywords(updated_keywords)
                     st.success("키워드가 추가되었습니다.")
-                    st.rerun()
+                    rerun_app()
                 else:
                     st.warning("추가할 키워드를 입력해주세요.")
         except Exception as e:
@@ -95,7 +131,8 @@ if not st.session_state.results:
     with col_date:
         st.markdown("📅 **검색 기간 설정**")
         today = datetime.now().date()
-        default_start_date = today - timedelta(days=90)
+        # 기본 검색 기간을 최근 30일로 단축하여 빠른 분석 유도
+        default_start_date = today - timedelta(days=30)
         
         date_range = st.date_input(
             "기간 선택 (시작일, 종료일)",
@@ -105,100 +142,141 @@ if not st.session_state.results:
             label_visibility="visible"
         )
         
-        if date_range and len(date_range) == 2:
-            input_start_date, input_end_date = date_range
-        elif date_range and len(date_range) == 1:
-            input_start_date, input_end_date = date_range[0], date_range[0]
+        # 날짜 입력값 처리 로직 개선
+        if date_range:
+            if len(date_range) == 2:
+                input_start_date, input_end_date = date_range
+            elif len(date_range) == 1:
+                input_start_date, input_end_date = date_range[0], date_range[0]
+            else:
+                 input_start_date, input_end_date = default_start_date, today
         else:
             input_start_date, input_end_date = default_start_date, today
 
     with col_options:
-        st.markdown("💡 **분석 옵션**")
-        # 분석 유형 선택 대신 키워드 확장 옵션 제공
-        auto_expand = st.checkbox("AI 기반 자동 키워드 확장 활성화", value=True)
-        st.caption("활성화 시, AI가 관련성 높다고 판단한 사업에서 새로운 키워드를 추출하여 자동으로 저장합니다.")
+        st.markdown("⚙️ **고급 옵션**")
+        # AI 키워드 자동 확장 기본값 활성화
+        auto_expand = st.checkbox("AI 기반 키워드 자동 확장 사용", value=True, help="분석 결과를 바탕으로 AI가 새로운 키워드를 추천하고 자동으로 목록에 추가합니다.")
         
+        # 분석 실행 버튼
+        st.markdown("🚀 **분석 실행**")
+        if st.button("데이터 수집 및 AI 분석 시작", type="primary"):
+            if not service_key:
+                st.error("공공데이터 서비스 키는 필수입니다. 사이드바에서 입력해주세요.")
+            else:
+                # 데이터베이스 초기화
+                try:
+                    analyzer.setup_database()
+                    client = analyzer.NaraJangteoApiClient(service_key)
+                    loaded_keywords = analyzer.load_keywords(analyzer.INITIAL_KEYWORDS)
 
-    # 분석 시작 버튼
-    if st.button("분석 시작", type="primary", use_container_width=True):
-        if not service_key:
-            st.error("오류: 공공데이터 서비스 키를 입력해야 합니다.")
-        elif input_start_date > input_end_date:
-            st.error("오류: 시작일이 종료일보다 늦을 수 없습니다.")
-        else:
-            if not gemini_key:
-                st.warning("Gemini API 키가 입력되지 않았습니다. AI 관련성 분석, 전략 리포트, 키워드 확장은 생략됩니다.")
+                    # 분석 실행
+                    with st.spinner("분석이 진행 중입니다. 데이터 양과 API 상태에 따라 수 분 이상 소요될 수 있습니다..."):
+                        # 로그 출력 공간 확보
+                        log_placeholder = st.empty()
+                        
+                        # 실시간 로그 스트리밍 구현 (analyzer.run_analysis 수정 없이 진행)
+                        def run_and_stream_log():
+                            results = analyzer.run_analysis(
+                                search_keywords=loaded_keywords,
+                                client=client,
+                                gemini_key=gemini_key,
+                                start_date=input_start_date,
+                                end_date=input_end_date,
+                                auto_expand_keywords=auto_expand,
+                                min_relevance_score=st.session_state.min_score_threshold
+                            )
+                            # 최종 로그 표시
+                            if results and results.get('log'):
+                                log_placeholder.markdown("### 📊 분석 로그\n```\n" + "\n".join(results['log']) + "\n```")
+                            return results
 
-            try:
-                client = analyzer.NaraJangteoApiClient(service_key=service_key)
-                
-                # setup_database 호출
-                analyzer.setup_database()
-                
-                # 상세 키워드 로드
-                search_keywords = analyzer.load_keywords(analyzer.INITIAL_KEYWORDS)
-                
-                with st.spinner(f'[{input_start_date} ~ {input_end_date}] 하이브리드 탐색 및 AI 분석 중... (AI 분석 포함 시 시간이 소요될 수 있습니다)'):
-                    # 분석 함수 호출 시 AI 점수 임계값 전달
-                    st.session_state.results = analyzer.run_analysis(
-                        search_keywords, client, gemini_key, 
-                        start_date=input_start_date, end_date=input_end_date, 
-                        auto_expand_keywords=auto_expand, 
-                        min_relevance_score=st.session_state.min_score_threshold
-                    )
-                
-                st.rerun()
+                        st.session_state.results = run_and_stream_log()
+                        rerun_app()
 
-            except AttributeError as e:
-                # AttributeError 발생 시 명확한 안내 제공
-                st.error(f"🚨 모듈 로드 오류 발생: {e}")
-                st.error("analyzer.py 파일이 최신 버전인지 확인하고 애플리케이션을 재시작/재배포 해주세요. (사이드바의 진단 정보를 확인하세요)")
-            except Exception as e:
-                st.error(f"🚨 분석 실행 중 예상치 못한 오류가 발생했습니다: {e}")
-                st.exception(e)
+                except Exception as e:
+                    st.error(f"분석 실행 중 치명적 오류 발생: {e}")
+                    # 상세 오류 로그 출력
+                    import traceback
+                    st.code(traceback.format_exc())
 
-# --- 결과 표시 (수정됨) ---
+# --- 결과 표시 UI ---
 if st.session_state.results:
-    st.markdown("---")
-    st.header("📊 분석 결과")
     results = st.session_state.results
-    
-    # 실행 로그 우선 표시 (진단용)
-    st.subheader("📝 실행 로그 (상세 내역)")
-    # 로그 영역을 기본으로 확장하여 표시
-    with st.expander("로그 보기 (문제 해결을 위해 상세 내용을 확인하세요)", expanded=True):
-         st.text_area("로그 상세", value="\n".join(results.get("log", [])), height=400, key="log_results")
-    
-    # 분석 재시작 버튼 추가
-    if st.button("🔄 새로운 분석 시작하기 (설정 변경)", use_container_width=True):
-         st.session_state.results = None
-         st.rerun()
+    st.success("🎉 분석이 완료되었습니다!")
+
+    # 결과 다운로드 및 새로고침 버튼
+    col_dl, col_refresh = st.columns(2)
+    with col_dl:
+        if results.get("report_file_data"):
+            st.download_button(
+                label="📥 통합 엑셀 보고서 다운로드",
+                data=results["report_file_data"],
+                file_name=results["report_filename"],
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                type="primary"
+            )
+    with col_refresh:
+        if st.button("🔄 새로운 분석 시작하기"):
+            st.session_state.results = None
+            rerun_app()
 
     st.markdown("---")
 
-    risk_df = results.get("risk_df")
-    
-    # 보고서 다운로드 버튼
-    if results.get("report_file_data"):
-        st.success(f"분석 완료. AI 관련성 점수 {st.session_state.min_score_threshold}점 이상인 사업만 포함되었습니다.")
-        st.download_button(
-            label=f"📂 통합 엑셀 보고서 다운로드 (AI 평가 포함)",
-            data=results["report_file_data"],
-            file_name=results["report_filename"],
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-        )
-    else:
-         # 결과가 없는 경우 경고 메시지 및 로그 확인 안내 강화
-         st.error(f"❌ 보고서가 생성되지 않았습니다. 선택한 기간 및 AI 점수 임계값({st.session_state.min_score_threshold}점)에 해당하는 데이터가 없습니다. 상단의 실행 로그를 확인하고 설정을 조정해주세요.")
-
-    # (리스크 현황판, Gemini 리포트 표시는 기존과 동일하게 유지)
-    if risk_df is not None and not risk_df.empty:
-        st.subheader("⚠️ 사업 현황 리스크 분석")
-        st.dataframe(risk_df, use_container_width=True)
-        st.caption("리스크 등급은 공고 후 경과 시간(분석 시점 기준), 사전규격 공개 여부, 추정 가격 등을 바탕으로 자동 분석됩니다.")
-        
+    # AI 전략 보고서 (가장 먼저 표시)
     if results.get("gemini_report"):
+        st.subheader("⭐ AI 맞춤형 전략 분석 보고서 (Gemini)")
+        with st.expander("보고서 내용 보기", expanded=True):
+            st.markdown(results["gemini_report"])
         st.markdown("---")
-        st.subheader("✨ Gemini 전략 분석 리포트")
-        st.markdown(results["gemini_report"], unsafe_allow_html=True)
+
+    # 탭 기반 결과 표시
+    st.subheader("📊 분석 결과 요약")
+
+    tab_main, tab_order_plan, tab_risk, tab_log = st.tabs(["종합 현황 보고서", "발주계획 현황", "리스크 분석", "상세 로그"])
+
+    # 엑셀 파일 데이터를 다시 DataFrame으로 로드 (Streamlit 표시용)
+    def load_excel_sheet_to_df(sheet_name):
+        if results.get("report_file_data"):
+            try:
+                # MultiIndex 헤더 처리를 위해 header=[0, 1] 지정
+                header_rows = [0, 1] if sheet_name == "종합 현황 보고서" else [0]
+                df = pd.read_excel(io.BytesIO(results["report_file_data"]), sheet_name=sheet_name, header=header_rows)
+                
+                # 빈 셀(NaN)을 빈 문자열로 채우기 (표시 개선)
+                df = df.fillna("")
+                return df
+            except Exception as e:
+                st.warning(f"'{sheet_name}' 시트를 로드하는 데 실패했습니다: {e}")
+                return pd.DataFrame()
+        return pd.DataFrame()
+
+    with tab_main:
+        st.markdown(f"관련성 점수 **{st.session_state.min_score_threshold}점 이상**의 사업 목록입니다.")
+        df_main = load_excel_sheet_to_df("종합 현황 보고서")
+        if not df_main.empty:
+            # Streamlit 데이터 프레임 사용 (필터링 및 정렬 기능 제공)
+            st.dataframe(df_main, use_container_width=True, hide_index=True)
+        else:
+            st.info("해당하는 데이터가 없습니다. 사이드바에서 최소 관련성 점수 임계값을 낮춰보세요.")
+
+    with tab_order_plan:
+        st.markdown("향후 발주 예정인 사업 목록입니다.")
+        df_order_plan = load_excel_sheet_to_df("발주계획 현황")
+        if not df_order_plan.empty:
+             st.dataframe(df_order_plan, use_container_width=True, hide_index=True)
+        else:
+             st.info("해당하는 발주계획 데이터가 없습니다.")
+
+    with tab_risk:
+        st.markdown("진행 중인 사업의 리스크 분석 결과입니다.")
+        # 리스크 분석은 analyzer.py에서 직접 DataFrame으로 반환됨
+        if results.get("risk_df") is not None and not results["risk_df"].empty:
+            st.dataframe(results["risk_df"], use_container_width=True, hide_index=True)
+        else:
+            st.info("분석 대상 리스크 데이터가 없습니다.")
+
+    with tab_log:
+        st.markdown("시스템 실행 상세 로그입니다.")
+        if results.get("log"):
+            st.code("\n".join(results["log"]))
