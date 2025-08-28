@@ -4,3 +4,4 @@ streamlit
 pandas
 google-generativeai
 xlsxwriter
+plotly
